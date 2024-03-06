@@ -1,6 +1,6 @@
-# Monkey Tool for Comfyui
+# ComfyUI Monkeys
 
-**monkey-tools-comfyui** is an extension designed to integrate [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
+**ComfyUI_Monkeys** is an extension designed to integrate [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
 with [Monkeys Platform](https://ai.infmonkeys.com).
 It made it's possible to run ComfyUI workflow by external services easily by HTTP APIs, and the ability to run ComfyUI
 workflow as single Block in **Monkeys Workflow Engine**.
