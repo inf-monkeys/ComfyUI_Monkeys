@@ -1,5 +1,6 @@
 import asyncio
 import os.path
+import shutil
 
 import server
 import sys
@@ -12,6 +13,20 @@ import urllib.parse
 import urllib.request
 import threading
 import logging
+import boto3
+from botocore.client import Config
+
+# paths
+comfyui_monkeys_path = os.path.dirname(__file__)
+comfy_path = os.path.dirname(folder_paths.__file__)
+custom_nodes_path = os.path.join(comfy_path, 'custom_nodes')
+js_path = os.path.join(comfy_path, "web", "extensions")
+
+config_folder = os.path.join(comfyui_monkeys_path, 'config')
+if not os.path.exists(config_folder):
+    os.mkdir(config_folder)
+
+s3_config_file = os.path.join(config_folder, 's3.json')
 
 logging.basicConfig(format='[%(name)s] %(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 # 创建日志记录器
@@ -45,10 +60,42 @@ async def get_task(prompt_id):
             return result
 
 
-def get_image_url(base_url, filename, subfolder, folder_type):
-    data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
-    url_values = urllib.parse.urlencode(data)
-    return "{}/view?{}".format(base_url, url_values)
+def get_asset_url(base_url, filename, subfolder, folder_type):
+    s3_enabled = False
+    if os.path.exists(s3_config_file):
+        try:
+            with open(s3_config_file, 'r', encoding="utf-8") as f:
+                s3_config = json.load(f)
+                s3_enabled = s3_config.get('enabled')
+        except Exception as e:
+            logger.warning("Load s3 config failed: ", str(e))
+
+    if s3_enabled:
+        endpoint_url = s3_config.get('endpoint_url')
+        aws_access_key_id = s3_config.get('aws_access_key_id')
+        aws_secret_access_key = s3_config.get('aws_secret_access_key')
+        region_name = s3_config.get('region_name')
+        addressing_style = s3_config.get('addressing_style', 'auto')
+        bucket = s3_config.get('bucket')
+        public_access_url = s3_config.get('public_access_url')
+        key = f'artworks/{uuid.uuid1().hex}.{filename.split(".")[-1]}'
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=region_name,
+            config=Config(s3={'addressing_style': addressing_style})
+        )
+        local_path = comfy_path.join('output').join(subfolder).join(filename)
+        with open(local_path, 'rb') as file:
+            file_bytes = file.read()
+            s3.put_object(Bucket=bucket, Key=key, Body=file_bytes)
+            return f'{public_access_url}/{key}'
+    else:
+        data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
+        url_values = urllib.parse.urlencode(data)
+        return "{}/view?{}".format(base_url, url_values)
 
 
 async def queue_prompt(workflow_json):
@@ -69,11 +116,11 @@ async def get_assets_in_result(base_url, prompt_id):
         node_output = history['outputs'][node_id]
         if 'images' in node_output:
             for image in node_output['images']:
-                image_url = get_image_url(base_url, image['filename'], image['subfolder'], image['type'])
+                image_url = get_asset_url(base_url, image['filename'], image['subfolder'], image['type'])
                 output_images.append(image_url)
         elif 'gifs' in node_output:
             for video in node_output['gifs']:
-                video_url = get_image_url(base_url, video['filename'], video['subfolder'], video['type'])
+                video_url = get_asset_url(base_url, video['filename'], video['subfolder'], video['type'])
                 output_videos.append(video_url)
     return {
         "images": output_images,
@@ -105,7 +152,6 @@ def track_progress(prompt, prompt_id):
                 if data['node'] not in finished_nodes:
                     finished_nodes.append(data['node'])
                     print('Progess: ', len(finished_nodes), '/', len(node_ids), ' Tasks done')
-
                 if data['node'] is None and data['prompt_id'] == prompt_id:
                     break  # Execution is done
             # if message['type'] == 'status':
@@ -225,3 +271,107 @@ async def image_to_image(request):
         "__monkeyLogsUrl": f"/monkeys/logs/{prompt_id}",
         "__monkeyResultUrl": f"/monkeys/history/{prompt_id}",
     })
+
+
+async def test_s3_connection(json_data):
+    endpoint_url = json_data.get('endpoint_url')
+    aws_access_key_id = json_data.get('aws_access_key_id')
+    aws_secret_access_key = json_data.get('aws_secret_access_key')
+    region_name = json_data.get('region_name')
+    addressing_style = json_data.get('addressing_style', 'auto')
+    bucket = json_data.get('bucket')
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=region_name,
+        config=Config(s3={'addressing_style': addressing_style})
+    )
+    s3.head_bucket(Bucket=bucket)
+
+
+@server.PromptServer.instance.routes.post("/monkeys/test-s3")
+async def test_s3(request):
+    json_data = await request.json()
+    try:
+        await asyncio.wait_for(test_s3_connection(json_data), timeout=3)
+        return web.json_response({
+            "success": True
+        })
+    except Exception as e:
+        return web.json_response({
+            "success": False,
+            "errMsg": str(e)
+        })
+
+
+@server.PromptServer.instance.routes.post("/monkeys/save-s3-config")
+async def save_s3_config(request):
+    json_data = await request.json()
+    enabled = json_data.get('enabled')
+    endpoint_url = json_data.get('endpoint_url')
+    aws_access_key_id = json_data.get('aws_access_key_id')
+    aws_secret_access_key = json_data.get('aws_secret_access_key')
+    region_name = json_data.get('region_name')
+    addressing_style = json_data.get('addressing_style', 'auto')
+    public_access_url = json_data.get('public_access_url')
+    bucket = json_data.get('bucket')
+    with open(s3_config_file, 'w') as f:
+        f.write(json.dumps({
+            "enabled": enabled,
+            "endpoint_url": endpoint_url,
+            "aws_access_key_id": aws_access_key_id,
+            "aws_secret_access_key": aws_secret_access_key,
+            "region_name": region_name,
+            "addressing_style": addressing_style,
+            "bucket": bucket,
+            "public_access_url": public_access_url
+        }))
+    return web.json_response({
+        "success": True
+    })
+
+
+@server.PromptServer.instance.routes.get("/monkeys/get-s3-config")
+async def get_s3_config(request):
+    if os.path.exists(s3_config_file):
+        try:
+            with open(s3_config_file, 'r', encoding="utf-8") as f:
+                return web.json_response({
+                    "success": True,
+                    "data": json.load(f)
+                })
+        except Exception as e:
+            return web.json_response({
+                "success": False,
+                "errMsg": str(e)
+            })
+    else:
+        return web.json_response({
+            "success": False
+        })
+
+
+def setup_js():
+    import nodes
+    js_dest_path = os.path.join(js_path, "comfyui-monkeys")
+
+    if hasattr(nodes, "EXTENSION_WEB_DIRS"):
+        if os.path.exists(js_dest_path):
+            shutil.rmtree(js_dest_path)
+    else:
+        logger.warning(f"Your ComfyUI version is outdated. Please update to the latest version.")
+        # setup js
+        if not os.path.exists(js_dest_path):
+            os.makedirs(js_dest_path)
+        js_src_path = os.path.join(comfyui_monkeys_path, "js", "comfyui-monkeys.js")
+
+        print(f"### ComfyUI-Manager: Copy .js from '{js_src_path}' to '{js_dest_path}'")
+        shutil.copy(js_src_path, js_dest_path)
+
+
+WEB_DIRECTORY = "js"
+setup_js()
+
+NODE_CLASS_MAPPINGS = {}
