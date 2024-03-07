@@ -2,6 +2,7 @@ import asyncio
 import os.path
 import shutil
 
+import requests
 import server
 import sys
 import folder_paths
@@ -15,6 +16,7 @@ import threading
 import logging
 import boto3
 from botocore.client import Config
+from .storage import LocalFileStorage
 
 # paths
 comfyui_monkeys_path = os.path.dirname(__file__)
@@ -48,16 +50,22 @@ client_id = str(uuid.uuid4())
 ws = websocket.WebSocket()
 ws_url = "ws://127.0.0.1:{}/ws?clientId={}".format(args.port, client_id)
 
-PROMPTID_TO_PROMPT_MAP = {}
+"""每个 Task 存储的信息
+{
+    "taskId": {
+        "prompt_id": "xxx-xxx-xxx-xxx",
+        "status": "PENDING", // IN_PROGRESS, FAILED, COMPLETED
+    }
+}
+"""
+TASKID_INFO = {}
 PROMPTID_TO_STATUS_MAP = {}
 
 
-async def get_task(prompt_id):
+def get_task(prompt_id):
     api = f"http://127.0.0.1:{args.port}/history/{prompt_id}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(api) as response:
-            result = await response.json()
-            return result
+    res = requests.get(api)
+    return res.json()
 
 
 def get_asset_url(base_url, filename, subfolder, folder_type):
@@ -87,7 +95,8 @@ def get_asset_url(base_url, filename, subfolder, folder_type):
             region_name=region_name,
             config=Config(s3={'addressing_style': addressing_style})
         )
-        local_path = comfy_path.join('output').join(subfolder).join(filename)
+        local_path = os.path.join(comfy_path, 'output', subfolder, filename)
+        logger.info(f"Start to upload {local_path} to s3")
         with open(local_path, 'rb') as file:
             file_bytes = file.read()
             s3.put_object(Bucket=bucket, Key=key, Body=file_bytes)
@@ -98,19 +107,31 @@ def get_asset_url(base_url, filename, subfolder, folder_type):
         return "{}/view?{}".format(base_url, url_values)
 
 
-async def queue_prompt(workflow_json):
+def queue_prompt(task_id, base_url, workflow_json, requirements=None):
+    LocalFileStorage.start_task(task_id, workflow_json)
     api = f"http://127.0.0.1:{args.port}/prompt"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(api, json=workflow_json) as response:
-            result = await response.json()
-            print(result)
-            return result['prompt_id']
+
+    if requirements:
+        for item in requirements:
+            file_path = os.path.join(comfy_path, item.get('path'), item.get('filename'))
+            if not os.path.exists(file_path):
+                url = item.get('url')
+                logging.info(f'Downloading {url} to {file_path}')
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                os.system(f'wget -q -O {file_path} "{url}"')
+
+    res = requests.post(api,
+                        data=json.dumps(workflow_json).encode(), headers=JSON_HEADERS, timeout=5)
+    result = res.json()
+    prompt_id = result['prompt_id']
+    LocalFileStorage.update_task_status(task_id, status="IN_PROGRESS", prompt_id=prompt_id)
+    track_progress(task_id, base_url, workflow_json['prompt'], prompt_id)
 
 
-async def get_assets_in_result(base_url, prompt_id):
+def get_assets_in_result(base_url, prompt_id):
     output_images = []
     output_videos = []
-    result = await get_task(prompt_id)
+    result = get_task(prompt_id)
     history = result[prompt_id]
     for node_id in history['outputs']:
         node_output = history['outputs'][node_id]
@@ -128,7 +149,7 @@ async def get_assets_in_result(base_url, prompt_id):
     }
 
 
-def track_progress(prompt, prompt_id):
+def track_progress(task_id, base_url, prompt, prompt_id):
     node_ids = list(prompt.keys())
     finished_nodes = []
     ws.connect(ws_url)
@@ -161,7 +182,15 @@ def track_progress(prompt, prompt_id):
         else:
             continue
 
-    PROMPTID_TO_STATUS_MAP[prompt_id] = 'FINISHED'
+    status = "COMPLETED" if len(finished_nodes) >= len(node_ids) else "FAILED"
+    kwargs = {}
+    if status == 'COMPLETED':
+        try:
+            kwargs['data'] = get_assets_in_result(base_url, prompt_id)
+        except Exception as e:
+            kwargs['status'] = 'FAILED'
+            kwargs['errMsg'] = str(e)
+    LocalFileStorage.update_task_status(task_id=task_id, status=status, **kwargs)
 
 
 @server.PromptServer.instance.routes.get("/monkeys/all-models")
@@ -191,20 +220,24 @@ async def get_all_models(request):
     return web.json_response(data)
 
 
-@server.PromptServer.instance.routes.get("/monkeys/history/{prompt_id}")
+@server.PromptServer.instance.routes.get("/monkeys/tasks/{task_id}")
 async def get_prompt_execution_status(request):
-    prompt_id = request.match_info.get('prompt_id')
-    status = PROMPTID_TO_STATUS_MAP.get(prompt_id)
-    if status == 'FINISHED':
-        result = await get_assets_in_result("http://localhost:8188", prompt_id)
-        return web.json_response({"status": "FINISHED", "data": result})
-    else:
-        return web.json_response({"status": "IN_PROGRESS"})
+    task_id = request.match_info.get('task_id')
+    data = LocalFileStorage.get_task(task_id)
+    if 'status' not in data:
+        data['status'] = 'PENDING'
+    return web.json_response(data)
 
 
 @server.PromptServer.instance.routes.get("/monkeys/logs/<string:prompt_id>")
 async def get_prompt_logs(request, prompt_id):
     pass
+
+
+def get_base_url(request):
+    host = request.host
+    scheme = request.scheme
+    return f"{scheme}://{host}"
 
 
 @server.PromptServer.instance.routes.post("/monkeys/text-to-image")
@@ -215,6 +248,7 @@ async def text_to_image(request):
     with open(template_filename, "r", encoding='utf-8') as f:
         workflow_template_str = f.read()
 
+    task_id = uuid.uuid4()
     model_name = json_data.get('modelName')
     prompt = json_data.get('prompt')
     negative_prompt = json_data.get('negativePrompt')
@@ -223,7 +257,7 @@ async def text_to_image(request):
     width = json_data.get('width')
     height = json_data.get('height')
     batch_count = json_data.get('batchCount')
-    await asyncio.sleep(3)
+    requirements = json_data.get('requirements', [])
     workflow_str = workflow_template_str.replace("<ModelName>", model_name).replace("<Prompt>", prompt).replace(
         "<NegativePrompt>", negative_prompt).replace("\"<SamplingStep>\"", str(sampling_step)).replace("\"<CfgScale>\"",
                                                                                                        str(cfg_scale)).replace(
@@ -234,24 +268,22 @@ async def text_to_image(request):
     workflow_json = json.loads(workflow_str)
     workflow_json['client_id'] = client_id
     logger.info("Receive new text to image task.")
-    prompt_id = await queue_prompt(workflow_json)
-    logger.info(f"Start prompt, prompt_id={prompt_id}")
+    base_url = get_base_url(request)
 
-    PROMPTID_TO_PROMPT_MAP[prompt_id] = workflow_json['prompt']
-
-    t = threading.Thread(target=track_progress, args=(workflow_json['prompt'], prompt_id))
+    t = threading.Thread(target=queue_prompt, args=(task_id, base_url, workflow_json, requirements))
     t.start()
 
     return web.json_response({
-        "__monkeyLogUrl": f"/monkeys/history/{prompt_id}",
-        "__monkeyResultUrl": f"/monkeys/logs/{prompt_id}",
+        "__monkeyLogUrl": f"/monkeys/tasks/{task_id}",
+        "__monkeyResultUrl": f"/monkeys/logs/{task_id}",
     })
 
 
 @server.PromptServer.instance.routes.post("/monkeys/image-to-image")
 async def image_to_image(request):
     json_data = await request.json()
-
+    requirements = json_data.get('requirements', [])
+    task_id = uuid.uuid4()
     template_filename = os.path.join(os.path.dirname(__file__), "templates", "image_to_image.json")
     with open(template_filename, "r", encoding='utf-8') as f:
         workflow_template_str = f.read()
@@ -259,17 +291,14 @@ async def image_to_image(request):
     workflow_json = json.loads(workflow_template_str)
     workflow_json['client_id'] = client_id
     logger.info("Receive new image to image task.")
-    prompt_id = await queue_prompt(workflow_json)
-    logger.info(f"Start prompt, prompt_id={prompt_id}")
+    base_url = get_base_url(request)
 
-    PROMPTID_TO_PROMPT_MAP[prompt_id] = workflow_json['prompt']
-
-    t = threading.Thread(target=track_progress, args=(workflow_json['prompt'], prompt_id))
+    t = threading.Thread(target=queue_prompt, args=(task_id, base_url, workflow_json, requirements))
     t.start()
 
     return web.json_response({
-        "__monkeyLogsUrl": f"/monkeys/logs/{prompt_id}",
-        "__monkeyResultUrl": f"/monkeys/history/{prompt_id}",
+        "__monkeyLogsUrl": f"/monkeys/logs/{task_id}",
+        "__monkeyResultUrl": f"/monkeys/tasks/{task_id}",
     })
 
 
