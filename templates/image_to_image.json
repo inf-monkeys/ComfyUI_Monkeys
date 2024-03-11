@@ -3,8 +3,8 @@
     "3": {
       "inputs": {
         "seed": 618368219913756,
-        "steps": 20,
-        "cfg": 8,
+        "steps": "<SamplingStep>",
+        "cfg": "<CfgScale>",
         "sampler_name": "dpmpp_2m",
         "scheduler": "normal",
         "denoise": 0.8700000000000001,
@@ -29,7 +29,7 @@
     },
     "6": {
       "inputs": {
-        "text": "photograph of victorian woman with wings, sky clouds, meadow grass\n",
+        "text": "<Prompt>",
         "clip": [
           "14",
           1
@@ -39,7 +39,7 @@
     },
     "7": {
       "inputs": {
-        "text": "watermark, text\n",
+        "text": "<NegativePrompt>",
         "clip": [
           "14",
           1
@@ -72,7 +72,7 @@
     },
     "10": {
       "inputs": {
-        "image": "example.png",
+        "image": "<ImagePath>",
         "upload": "image"
       },
       "class_type": "LoadImage"
@@ -372,7 +372,7 @@
               "Node name for S&R": "CheckpointLoaderSimple"
             },
             "widgets_values": [
-              "v1-5-pruned-emaonly.ckpt"
+              "<ModelName>"
             ]
           },
           {

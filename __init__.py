@@ -50,17 +50,6 @@ client_id = str(uuid.uuid4())
 ws = websocket.WebSocket()
 ws_url = "ws://127.0.0.1:{}/ws?clientId={}".format(args.port, client_id)
 
-"""每个 Task 存储的信息
-{
-    "taskId": {
-        "prompt_id": "xxx-xxx-xxx-xxx",
-        "status": "PENDING", // IN_PROGRESS, FAILED, COMPLETED
-    }
-}
-"""
-TASKID_INFO = {}
-PROMPTID_TO_STATUS_MAP = {}
-
 
 def get_task(prompt_id):
     api = f"http://127.0.0.1:{args.port}/history/{prompt_id}"
@@ -120,8 +109,7 @@ def queue_prompt(task_id, base_url, workflow_json, requirements=None):
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
                 os.system(f'wget -q -O {file_path} "{url}"')
 
-    res = requests.post(api,
-                        data=json.dumps(workflow_json).encode(), headers=JSON_HEADERS, timeout=5)
+    res = requests.post(api, data=json.dumps(workflow_json).encode(), headers=JSON_HEADERS, timeout=5)
     result = res.json()
     prompt_id = result['prompt_id']
     LocalFileStorage.update_task_status(task_id, status="IN_PROGRESS", prompt_id=prompt_id)
@@ -282,13 +270,46 @@ async def text_to_image(request):
 @server.PromptServer.instance.routes.post("/monkeys/image-to-image")
 async def image_to_image(request):
     json_data = await request.json()
-    requirements = json_data.get('requirements', [])
-    task_id = uuid.uuid4()
-    template_filename = os.path.join(os.path.dirname(__file__), "templates", "image_to_image.json")
+
+    template_filename = os.path.join(os.path.dirname(__file__), "templates", "text_to_image.json")
     with open(template_filename, "r", encoding='utf-8') as f:
         workflow_template_str = f.read()
 
-    workflow_json = json.loads(workflow_template_str)
+    task_id = uuid.uuid4()
+    model_name = json_data.get('modelName')
+    prompt = json_data.get('prompt')
+    negative_prompt = json_data.get('negativePrompt')
+    sampling_step = json_data.get('samplingStep')
+    cfg_scale = json_data.get('cfgScale')
+    image_path = json_data.get('imagePath')
+    requirements = json_data.get('requirements', [])
+    workflow_str = (workflow_template_str
+                    .replace("<ModelName>", model_name)
+                    .replace("<Prompt>", prompt)
+                    .replace("<NegativePrompt>", negative_prompt)
+                    .replace("\"<SamplingStep>\"", str(sampling_step))
+                    .replace("\"<CfgScale>\"", str(cfg_scale))
+                    .replace("<imagePath>", image_path))
+    workflow_json = json.loads(workflow_str)
+    workflow_json['client_id'] = client_id
+    logger.info("Receive new image to image task.")
+    base_url = get_base_url(request)
+
+    t = threading.Thread(target=queue_prompt, args=(task_id, base_url, workflow_json, requirements))
+    t.start()
+
+    return web.json_response({
+        "__monkeyLogsUrl": f"/monkeys/logs/{task_id}",
+        "__monkeyResultUrl": f"/monkeys/tasks/{task_id}",
+    })
+
+
+@server.PromptServer.instance.routes.post("/monkeys/run-prompt")
+async def run_prompt_api(request):
+    json_data = await request.json()
+    task_id = uuid.uuid4()
+    workflow_json = json_data.get('prompt')
+    requirements = json_data.get('requirements', [])
     workflow_json['client_id'] = client_id
     logger.info("Receive new image to image task.")
     base_url = get_base_url(request)
@@ -396,7 +417,7 @@ def setup_js():
             os.makedirs(js_dest_path)
         js_src_path = os.path.join(comfyui_monkeys_path, "js", "comfyui-monkeys.js")
 
-        print(f"### ComfyUI-Manager: Copy .js from '{js_src_path}' to '{js_dest_path}'")
+        print(f"### ComfyUI_Monkeys: Copy .js from '{js_src_path}' to '{js_dest_path}'")
         shutil.copy(js_src_path, js_dest_path)
 
 
