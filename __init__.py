@@ -1,6 +1,7 @@
 import asyncio
 import os.path
 import shutil
+import traceback
 
 import requests
 import server
@@ -97,7 +98,6 @@ def get_asset_url(base_url, filename, subfolder, folder_type):
 
 
 def queue_prompt(task_id, base_url, workflow_json, requirements=None):
-    LocalFileStorage.start_task(task_id, workflow_json)
     api = f"http://127.0.0.1:{args.port}/prompt"
 
     if requirements:
@@ -107,7 +107,9 @@ def queue_prompt(task_id, base_url, workflow_json, requirements=None):
                 url = item.get('url')
                 logging.info(f'Downloading {url} to {file_path}')
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                os.system(f'wget -q -O {file_path} "{url}"')
+                command = f'wget -q -O {file_path} "{url}"'
+                logger.info(f"Run command {command}")
+                os.system(command)
 
     res = requests.post(api, data=json.dumps(workflow_json).encode(), headers=JSON_HEADERS, timeout=5)
     result = res.json()
@@ -141,6 +143,7 @@ def track_progress(task_id, base_url, prompt, prompt_id):
     node_ids = list(prompt.keys())
     finished_nodes = []
     ws.connect(ws_url)
+    cached = False
     while True:
         out = ws.recv()
         if isinstance(out, str):
@@ -163,19 +166,21 @@ def track_progress(task_id, base_url, prompt, prompt_id):
                     print('Progess: ', len(finished_nodes), '/', len(node_ids), ' Tasks done')
                 if data['node'] is None and data['prompt_id'] == prompt_id:
                     break  # Execution is done
-            # if message['type'] == 'status':
-            #     queue_remaining = message.get('data', {}).get('status', {}).get('exec_info', {}).get('queue_remaining')
-            #     if queue_remaining == 0:
-            #         break
+            if message['type'] == 'status':
+                queue_remaining = message.get('data', {}).get('status', {}).get('exec_info', {}).get('queue_remaining')
+                if queue_remaining == 0:
+                    cached = True
+                    break
         else:
             continue
 
-    status = "COMPLETED" if len(finished_nodes) >= len(node_ids) else "FAILED"
+    status = "COMPLETED" if len(finished_nodes) >= len(node_ids) or cached else "FAILED"
     kwargs = {}
     if status == 'COMPLETED':
         try:
             kwargs['data'] = get_assets_in_result(base_url, prompt_id)
         except Exception as e:
+            traceback.print_exc()
             kwargs['status'] = 'FAILED'
             kwargs['errMsg'] = str(e)
     LocalFileStorage.update_task_status(task_id=task_id, status=status, **kwargs)
@@ -258,12 +263,13 @@ async def text_to_image(request):
     logger.info("Receive new text to image task.")
     base_url = get_base_url(request)
 
+    LocalFileStorage.start_task(task_id, workflow_json)
     t = threading.Thread(target=queue_prompt, args=(task_id, base_url, workflow_json, requirements))
     t.start()
 
     return web.json_response({
-        "__monkeyLogUrl": f"/monkeys/tasks/{task_id}",
-        "__monkeyResultUrl": f"/monkeys/logs/{task_id}",
+        "__monkeyLogUrl": f"/monkeys/logs/{task_id}",
+        "__monkeyResultUrl": f"/monkeys/tasks/{task_id}",
     })
 
 
@@ -295,6 +301,7 @@ async def image_to_image(request):
     logger.info("Receive new image to image task.")
     base_url = get_base_url(request)
 
+    LocalFileStorage.start_task(task_id, workflow_json)
     t = threading.Thread(target=queue_prompt, args=(task_id, base_url, workflow_json, requirements))
     t.start()
 
