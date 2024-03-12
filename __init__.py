@@ -186,6 +186,13 @@ def track_progress(task_id, base_url, prompt, prompt_id):
     LocalFileStorage.update_task_status(task_id=task_id, status=status, **kwargs)
 
 
+@server.PromptServer.instance.routes.get("/monkeys/healthz")
+async def health_check(request):
+    return web.json_response({
+        "success": True
+    })
+
+
 @server.PromptServer.instance.routes.get("/monkeys/all-models")
 async def get_all_models(request):
     sub_folders = [
