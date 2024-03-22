@@ -215,8 +215,11 @@ async def get_all_models(request):
     ]
     data = {}
     for sub_folder in sub_folders:
-        filenames = folder_paths.get_filename_list(sub_folder)
-        data[sub_folder] = filenames
+        try:
+            filenames = folder_paths.get_filename_list(sub_folder)
+            data[sub_folder] = filenames
+        except Exception as e:
+            data[sub_folder] = []
     return web.json_response(data)
 
 
