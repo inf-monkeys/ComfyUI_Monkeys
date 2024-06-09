@@ -1,5 +1,7 @@
 # ComfyUI Monkeys
 
+> **This project is archived, moved to [https://github.com/inf-monkeys/Comfyfile](https://github.com/inf-monkeys/Comfyfile)**
+
 **ComfyUI_Monkeys** is an extension designed to integrate [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
 with [Monkeys Platform](https://ai.infmonkeys.com).
 It made it's possible to run ComfyUI workflow by external services easily by HTTP APIs, and the ability to run ComfyUI
